@@ -135,6 +135,7 @@ def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
 @amp.autocast(enabled=False)
 @torch.compiler.disable()
 def rope_apply(x, grid_sizes, freqs):
+    freqs = freqs.to(torch.complex64)
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -200,6 +201,7 @@ class WanLayerNorm(nn.LayerNorm):
             x(Tensor): Shape [B, L, C]
         """
         return super().forward(x)
+        # TODO: implement
 
 
 class WanSelfAttention(nn.Module):
@@ -454,6 +456,7 @@ class WanAttentionBlock(nn.Module):
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             # cross-attention
+            x = x.float() # convert to f32
             x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype, t=t)
 
             # ffn function
