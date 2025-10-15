@@ -1253,6 +1253,17 @@ def main():
                 closest_size, closest_ratio = get_closest_ratio(h, w, ratios=aspect_ratio_sample_size)
                 closest_size = [int(x / 16) * 16 for x in closest_size]
 
+            min_example_length = min(
+                [example["pixel_values"].shape[0] for example in examples]
+            )
+            batch_video_length = int(min(batch_video_length, min_example_length))
+            
+            # Magvae needs the number of frames to be 4n + 1.
+            batch_video_length = (batch_video_length - 1) // sample_n_frames_bucket_interval * sample_n_frames_bucket_interval + 1
+
+            if batch_video_length <= 0:
+                batch_video_length = 1
+
             for example in examples:
                 if args.fix_sample_size is not None:
                     # To 0~1
@@ -1303,16 +1314,9 @@ def main():
                         transforms.CenterCrop(closest_size),
                         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
                     ])
-                new_examples["pixel_values"].append(transform(pixel_values))
+                
+                new_examples["pixel_values"].append(transform(pixel_values)[:batch_video_length])
                 new_examples["text"].append(example["text"])
-
-                batch_video_length = int(min(batch_video_length, len(pixel_values)))
-
-                # Magvae needs the number of frames to be 4n + 1.
-                batch_video_length = (batch_video_length - 1) // sample_n_frames_bucket_interval * sample_n_frames_bucket_interval + 1
-
-                if batch_video_length <= 0:
-                    batch_video_length = 1
 
                 if args.train_mode != "normal":
                     mask = get_random_mask(new_examples["pixel_values"][-1].size(), image_start_only=True)
@@ -1327,10 +1331,10 @@ def main():
                     new_examples["clip_pixel_values"].append(clip_pixel_values)
 
             # Limit the number of frames to the same
-            new_examples["pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["pixel_values"]])
+            new_examples["pixel_values"] = torch.stack([example for example in new_examples["pixel_values"]])
             if args.train_mode != "normal":
-                new_examples["mask_pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["mask_pixel_values"]])
-                new_examples["mask"] = torch.stack([example[:batch_video_length] for example in new_examples["mask"]])
+                new_examples["mask_pixel_values"] = torch.stack([example for example in new_examples["mask_pixel_values"]])
+                new_examples["mask"] = torch.stack([example for example in new_examples["mask"]])
                 new_examples["clip_pixel_values"] = torch.stack([example for example in new_examples["clip_pixel_values"]])
 
             # Encode prompts when enable_text_encoder_in_dataloader=True
@@ -1780,7 +1784,7 @@ def main():
                 loss = custom_mse_loss(noise_pred.float(), target.float(), weighting.float())
                 loss = loss.mean()
 
-                if args.motion_sub_loss and noise_pred.size()[1] > 2:
+                if args.motion_sub_loss and noise_pred.size()[2] > 2:
                     gt_sub_noise = noise_pred[:, :, 1:].float() - noise_pred[:, :, :-1].float()
                     pre_sub_noise = target[:, :, 1:].float() - target[:, :, :-1].float()
                     sub_loss = F.mse_loss(gt_sub_noise, pre_sub_noise, reduction="mean")
@@ -1850,6 +1854,9 @@ def main():
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
@@ -1912,6 +1919,9 @@ def main():
             ema_transformer3d.copy_to(transformer3d.parameters())
 
     if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
         accelerator.save_state(save_path)
         logger.info(f"Saved state to {save_path}")

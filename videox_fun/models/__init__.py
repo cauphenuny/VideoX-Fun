@@ -6,9 +6,10 @@ from transformers import (AutoTokenizer, CLIPImageProcessor, CLIPTextModel,
                           T5EncoderModel, T5Tokenizer, T5TokenizerFast)
 
 try:
-    from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
+    from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor, Qwen2_5_VLConfig
 except:
     Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer = None, None
+    Qwen2VLProcessor, Qwen2_5_VLConfig = None, None
     print("Your transformers version is too old to load Qwen2_5_VLForConditionalGeneration and Qwen2Tokenizer. If you wish to use QwenImage, please upgrade your transformers package to the latest version.")
 
 from .cogvideox_transformer3d import CogVideoXTransformer3DModel
@@ -70,6 +71,9 @@ if importlib.util.find_spec("paifuser") is not None:
     WanTransformer3DModel.enable_cfg_skip = enable_cfg_skip()(WanTransformer3DModel.enable_cfg_skip)
     WanTransformer3DModel.disable_cfg_skip = disable_cfg_skip()(WanTransformer3DModel.disable_cfg_skip)
     WanTransformer3DModel.share_cfg_skip = share_cfg_skip()(WanTransformer3DModel.share_cfg_skip)
+
+    QwenImageTransformer2DModel.enable_cfg_skip = enable_cfg_skip()(QwenImageTransformer2DModel.enable_cfg_skip)
+    QwenImageTransformer2DModel.disable_cfg_skip = disable_cfg_skip()(QwenImageTransformer2DModel.disable_cfg_skip)
     print("Import CFG Skip Turbo")
 
     # --------------------------------------------------------------- #

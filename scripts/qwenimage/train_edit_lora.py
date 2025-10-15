@@ -24,7 +24,6 @@ import pickle
 import random
 import shutil
 import sys
-import copy
 
 import accelerate
 import diffusers
@@ -34,10 +33,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 import torchvision.transforms.functional as TF
 import transformers
-from typing import NamedTuple, List, Optional, Union
-
-
-from accelerate import Accelerator
+from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -52,6 +48,9 @@ from einops import rearrange
 from omegaconf import OmegaConf
 from packaging import version
 from PIL import Image
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullOptimStateDictConfig, FullStateDictConfig, ShardedOptimStateDictConfig,
+    ShardedStateDictConfig)
 from torch.utils.data import RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
@@ -70,18 +69,19 @@ from videox_fun.data.bucket_sampler import (ASPECT_RATIO_512,
                                             ASPECT_RATIO_RANDOM_CROP_PROB,
                                             AspectRatioBatchImageVideoSampler,
                                             RandomSampler, get_closest_ratio)
+from videox_fun.data.dataset_image import ImageEditDataset
 from videox_fun.data.dataset_image_video import (ImageVideoDataset,
                                                  ImageVideoSampler,
                                                  get_random_mask)
-from videox_fun.models import (AutoencoderKL, AutoencoderKLWan,
+from videox_fun.models import (AutoencoderKLQwenImage, AutoencoderKLWan,
                                Qwen2_5_VLForConditionalGeneration,
-                               Qwen2Tokenizer, QwenImageTransformer2DModel)
-from videox_fun.dist import set_multi_gpus_devices, shard_model
-from videox_fun.models import (CLIPImageProcessor, CLIPTextModel,
-                               CLIPTokenizer, CLIPVisionModelWithProjection,
-                               FluxTransformer2DModel, T5EncoderModel,
-                               T5TokenizerFast)
-from videox_fun.pipeline import FluxPipeline
+                               Qwen2Tokenizer, Qwen2VLProcessor,
+                               QwenImageTransformer2DModel)
+from videox_fun.pipeline import QwenImageEditPipeline, QwenImagePipeline
+from videox_fun.pipeline.pipeline_qwenimage_edit import (
+    PREFERRED_QWENIMAGE_RESOLUTIONS, calculate_dimensions)
+from videox_fun.pipeline.pipeline_qwenimage_edit_plus import (
+    CONDITION_IMAGE_SIZE, VAE_IMAGE_SIZE)
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import (create_network, merge_lora,
                                          unmerge_lora)
@@ -111,31 +111,6 @@ def generate_timestep_with_lognorm(low, high, shape, device="cpu", generator=Non
     t = 1 / (1 + torch.exp(-u)) * (high - low) + low
     return torch.clip(t.to(torch.int32), low, high - 1)
 
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
-
-def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
-    latent_image_ids = torch.zeros(height, width, 3)
-    latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
-    latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
-
-    latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
-
-    latent_image_ids = latent_image_ids.reshape(
-        latent_image_id_height * latent_image_id_width, latent_image_id_channels
-    )
-
-    return latent_image_ids.to(device=device, dtype=dtype)
-
 def _pack_latents(latents, batch_size, num_channels_latents, height, width):
     latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
     latents = latents.permute(0, 2, 4, 1, 3, 5)
@@ -149,112 +124,30 @@ def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
     split_result = torch.split(selected, valid_lengths.tolist(), dim=0)
 
     return split_result
-
-def _get_t5_prompt_embeds(
-    prompt = None,
-    max_sequence_length = 512,
-    tokenizer_2 = None,
-    text_encoder_2 = None,
-    device = None,
+    
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
 ):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
-
-    text_inputs = tokenizer_2(
-        prompt,
-        padding="max_length",
-        max_length=max_sequence_length,
-        truncation=True,
-        return_length=False,
-        return_overflowing_tokens=False,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
-    prompt_embeds = text_encoder_2(text_input_ids.to(device), output_hidden_states=False)[0]
-
-    dtype = text_encoder_2.dtype
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-
-    _, seq_len, _ = prompt_embeds.shape
-
-    return prompt_embeds
-
-def _get_clip_prompt_embeds(
-    prompt: Union[str, List[str]],
-    device: Optional[torch.device] = None,
-    tokenizer = None,
-    text_encoder = None,
-):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
-
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-        return_overflowing_tokens=False,
-        return_length=False,
-        return_tensors="pt",
-    )
-
-    text_input_ids = text_inputs.input_ids
-    prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=False)
-
-    # Use pooled output of CLIPTextModel
-    prompt_embeds = prompt_embeds.pooler_output
-    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
-
-    return prompt_embeds
-
-def encode_prompt(
-    prompt: Union[str, List[str]],
-    prompt_2: Optional[Union[str, List[str]]] = None,
-    device: Optional[torch.device] = None,
-    dtype = None,
-    max_sequence_length: int = 512,
-    text_encoder = None, 
-    tokenizer = None,
-    text_encoder_2 = None,
-    tokenizer_2 = None,
-):
-
-    # set lora scale so that monkey patched LoRA
-    # function of text encoder can correctly access it
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    prompt_2 = prompt_2 or prompt
-    prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
-
-    # We only use the pooled prompt output from the CLIPTextModel
-    pooled_prompt_embeds = _get_clip_prompt_embeds(
-        prompt=prompt,
-        device=device,
-        text_encoder=text_encoder, 
-        tokenizer=tokenizer,
-    )
-    prompt_embeds = _get_t5_prompt_embeds(
-        prompt=prompt_2,
-        max_sequence_length=max_sequence_length,
-        device=device,
-        text_encoder_2=text_encoder_2, 
-        tokenizer_2=tokenizer_2,
-    )
-
-    text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
-    return prompt_embeds, pooled_prompt_embeds, text_ids
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
-def log_validation(vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, transformer3d, network, args, accelerator, weight_dtype, global_step):
+def log_validation(vae, text_encoder, tokenizer, transformer3d, network, args, accelerator, weight_dtype, global_step):
     try:
         logger.info("Running validation... ")
 
-        transformer3d_val = FluxTransformer2DModel.from_pretrained(
+        transformer3d_val = QwenImageTransformer2DModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="transformer", torch_dtype=weight_dtype,
-            low_cpu_mem_usage=True,
         ).to(weight_dtype)
         transformer3d_val.load_state_dict(accelerator.unwrap_model(transformer3d).state_dict())
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -262,16 +155,15 @@ def log_validation(vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, tr
             subfolder="scheduler"
         )
         transformer3d = transformer3d.to("cpu")
-        pipeline = FluxPipeline(
+        pipeline = QwenImageEditPipeline(
             vae=accelerator.unwrap_model(vae).to(weight_dtype), 
             text_encoder=accelerator.unwrap_model(text_encoder),
-            text_encoder_2=accelerator.unwrap_model(text_encoder_2),
             tokenizer=tokenizer,
-            tokenizer_2=tokenizer_2,
             transformer=transformer3d_val,
             scheduler=scheduler,
         )
         pipeline = pipeline.to(accelerator.device)
+
         pipeline = merge_lora(
             pipeline, None, 1, accelerator.device, state_dict=accelerator.unwrap_model(network).state_dict(), transformer_only=True
         )
@@ -655,28 +547,12 @@ def parse_args():
         "--low_vram", action="store_true", help="Whether enable low_vram mode."
     )
     parser.add_argument(
-        "--prompt_template_encode",
-        type=str,
-        default="<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-        help=(
-            'The prompt template for text encoder.'
-        ),
-    )
-    parser.add_argument(
-        "--prompt_template_encode_start_idx",
-        type=int,
-        default=34,
-        help=(
-            'The start idx for prompt template.'
-        ),
-    )
-    parser.add_argument(
         "--train_mode",
         type=str,
-        default="normal",
+        default="qwen_image_edit",
         help=(
-            'The format of training data. Support `"normal"`'
-            ' (default), `"inpaint"`.'
+            'The format of training data. Support `"qwen_image_edit"`'
+            ' (default), `"qwen_image_edit_plus"`.'
         ),
     )
     parser.add_argument(
@@ -703,12 +579,6 @@ def parse_args():
         type=str,
         default=None,
         help=("The module is not trained in loras. "),
-    )
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=3.5,
-        help="the FLUX.1 dev variant is a guidance distilled model",
     )
 
     args = parser.parse_args()
@@ -837,11 +707,14 @@ def main():
     )
 
     # Get Tokenizer
-    tokenizer = CLIPTokenizer.from_pretrained(
+    tokenizer = Qwen2Tokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer"
     )
-    tokenizer_2 = T5TokenizerFast.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer_2"
+
+    # Get processor
+    processor = Qwen2VLProcessor.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="processor"
     )
 
     def deepspeed_zero_init_disabled_context_manager():
@@ -865,23 +738,29 @@ def main():
     # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
         # Get Text encoder
-        text_encoder = CLIPTextModel.from_pretrained(
+        text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=weight_dtype
         )
-        text_encoder_2 = T5EncoderModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=weight_dtype
-        )
         text_encoder = text_encoder.eval()
-        text_encoder_2 = text_encoder_2.eval()
+        if args.train_mode == "qwen_image_edit":
+            template = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+            drop_idx = 64
+        else:
+            template = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+            drop_idx = 64
+
         # Get Vae
-        vae = AutoencoderKL.from_pretrained(
+        vae = AutoencoderKLQwenImage.from_pretrained(
             args.pretrained_model_name_or_path, 
             subfolder="vae"
         ).to(weight_dtype)
         vae.eval()
-        
+        latents_mean = (torch.tensor(vae.config.latents_mean).view(1, vae.config.z_dim, 1, 1, 1)).to(accelerator.device)
+        latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(accelerator.device)
+        vae_scale_factor = 2 ** len(vae.temperal_downsample)
+
     # Get Transformer
-    transformer3d = FluxTransformer2DModel.from_pretrained(
+    transformer3d = QwenImageTransformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path, 
         subfolder="transformer",
         torch_dtype=weight_dtype,
@@ -890,7 +769,6 @@ def main():
     # Freeze vae and text_encoder and set transformer3d to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    text_encoder_2.requires_grad_(False)
     transformer3d.requires_grad_(False)
 
     # Lora will work with this...
@@ -1057,7 +935,7 @@ def main():
         args.random_hw_adapt = False
 
     # Get the dataset
-    train_dataset = ImageVideoDataset(
+    train_dataset = ImageEditDataset(
         args.train_data_meta, args.train_data_dir,
         image_sample_size=args.image_sample_size,
         enable_bucket=args.enable_bucket,
@@ -1116,12 +994,14 @@ def main():
             # Create new output
             new_examples                 = {}
             new_examples["pixel_values"] = []
+            new_examples["source_pixel_values"] = []
             new_examples["text"]         = []
 
             # Get downsample ratio in image 
-            pixel_value     = examples[0]["pixel_values"]
-            data_type       = examples[0]["data_type"]
-            f, h, w, c      = np.shape(pixel_value)
+            pixel_value         = examples[0]["pixel_values"]
+            source_pixel_values = examples[0]["source_pixel_values"]
+            data_type           = examples[0]["data_type"]
+            f, h, w, c          = np.shape(pixel_value)
 
             random_downsample_ratio = 1 if not args.random_hw_adapt else get_random_downsample_ratio(args.image_sample_size)
 
@@ -1194,7 +1074,13 @@ def main():
                         transforms.CenterCrop(closest_size),
                         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
                     ])
+                
+                source_pixel_values = []
+                for _source_pixel_value in example["source_pixel_values"]:
+                    source_pixel_values.append(np.array(_source_pixel_value))
+
                 new_examples["pixel_values"].append(transform(pixel_values))
+                new_examples["source_pixel_values"].append(source_pixel_values)
                 new_examples["text"].append(example["text"])
 
             # Limit the number of frames to the same
@@ -1202,17 +1088,39 @@ def main():
 
             # Encode prompts when enable_text_encoder_in_dataloader=True
             if args.enable_text_encoder_in_dataloader:
-                prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
-                    batch['text'], dtype=weight_dtype, device="cpu",
-                    text_encoder=text_encoder, 
-                    tokenizer=tokenizer,
-                    text_encoder_2=text_encoder_2, 
-                    tokenizer_2=tokenizer_2,
+                txt = [template.format(e) for e in batch['text']]
+                prompt_in_pixel_values = [
+                    Image.fromarray(np.array((source_pixel_value.float().cpu().permute(0, 2, 3, 1) * 0.5 + 0.5)[0], np.uint8)) for source_pixel_value in source_pixel_values
+                ]
+                model_inputs = processor(
+                    text=txt,
+                    images=prompt_in_pixel_values,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                encoder_hidden_states = text_encoder(
+                    input_ids=model_inputs.input_ids,
+                    attention_mask=model_inputs.attention_mask,
+                    pixel_values=model_inputs.pixel_values,
+                    image_grid_thw=model_inputs.image_grid_thw,
+                    output_hidden_states=True,
+                )
+                hidden_states = encoder_hidden_states.hidden_states[-1]
+                split_hidden_states = _extract_masked_hidden(hidden_states, model_inputs.attention_mask)
+                split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+                attn_mask_list = [torch.ones(e.size(0), dtype=torch.long) for e in split_hidden_states]
+                max_seq_len = max([e.size(0) for e in split_hidden_states])
+                prompt_embeds = torch.stack(
+                    [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+                )
+                encoder_attention_mask = torch.stack(
+                    [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
                 )
 
-                new_examples['pooled_prompt_embeds'] = pooled_prompt_embeds
-                new_examples['prompt_embeds'] = prompt_embeds
-                new_examples['text_ids'] = text_ids
+                prompt_embeds = prompt_embeds.to(dtype=latents.dtype)
+
+                new_examples['encoder_attention_mask'] = encoder_attention_mask
+                new_examples['encoder_hidden_states'] = prompt_embeds
 
             return new_examples
         
@@ -1274,17 +1182,14 @@ def main():
         from functools import partial
 
         from videox_fun.dist import set_multi_gpus_devices, shard_model
-        shard_fn = partial(shard_model, device_id=accelerator.device, param_dtype=weight_dtype, module_to_wrapper=text_encoder.text_model.encoder.layers)
+        shard_fn = partial(shard_model, device_id=accelerator.device, param_dtype=weight_dtype, module_to_wrapper=text_encoder.language_model.layers)
         text_encoder = shard_fn(text_encoder)
-        # shard_fn = partial(shard_model, device_id=accelerator.device, param_dtype=weight_dtype, module_to_wrapper=text_encoder_2.encoder.block)
-        # text_encoder_2 = shard_fn(text_encoder_2)
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
     transformer3d.to(accelerator.device, dtype=weight_dtype)
     if not args.enable_text_encoder_in_dataloader:
         text_encoder.to(accelerator.device)
-        text_encoder_2.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1425,7 +1330,7 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
-    if args.multi_stream and args.train_mode != "normal":
+    if args.multi_stream:
         # create extra cuda streams to speedup inpaint vae computation
         vae_stream_1 = torch.cuda.Stream()
         vae_stream_2 = torch.cuda.Stream()
@@ -1433,7 +1338,6 @@ def main():
         vae_stream_1 = None
         vae_stream_2 = None
 
-    # Calculate the index we need】
     idx_sampling = DiscreteSampling(args.train_sampling_steps, uniform_sampling=args.uniform_sampling)
 
     for epoch in range(first_epoch, args.num_train_epochs):
@@ -1443,28 +1347,85 @@ def main():
             # Data batch sanity check
             if epoch == first_epoch and step == 0:
                 pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
+                source_pixel_values = batch['source_pixel_values']
                 pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
+
                 os.makedirs(os.path.join(args.output_dir, "sanity_check"), exist_ok=True)
-                for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                for idx, (pixel_value, source_pixel_value, text) in enumerate(zip(pixel_values, source_pixel_values, texts)):
                     pixel_value = pixel_value[None, ...]
                     gif_name = '-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_step}-{idx}'
                     save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/{gif_name[:10]}.gif", rescale=True)
+                    for local_index, _source_pixel_value in enumerate(source_pixel_value):
+                        _source_pixel_value = Image.fromarray(np.uint8(_source_pixel_value))
+                        _source_pixel_value.save(f"{args.output_dir}/sanity_check/source_{local_index}_{gif_name[:10]}.jpg")
 
             with accelerator.accumulate(transformer3d):
                 # Convert images to latent space
                 pixel_values = batch["pixel_values"].to(weight_dtype)
+                source_pixel_values = batch["source_pixel_values"]
+
+                condition_image_sizes = []
+                condition_images = []
+                vae_image_sizes = []
+                vae_images = []
+
+                if args.train_mode == "qwen_image_edit":
+                    for source_pixel_value in source_pixel_values:
+                        _prompt_in_pixel_values = []
+                        _prompt_in_sizes = []
+                        for _source_pixel_value in source_pixel_value:
+                            source_image_height, source_image_width = np.shape(_source_pixel_value)[-2:]
+                            aspect_ratio = source_image_width / source_image_height
+                            _, source_image_width, source_image_height = min(
+                                (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_QWENIMAGE_RESOLUTIONS
+                            )
+                            multiple_of = vae_scale_factor * 2
+                            source_image_width = source_image_width // multiple_of * multiple_of
+                            source_image_height = source_image_height // multiple_of * multiple_of
+
+                            _source_pixel_value = Image.fromarray(np.array(_source_pixel_value, np.uint8))
+                            _source_pixel_value = _source_pixel_value.resize((source_image_width, source_image_height), resample=Image.LANCZOS)
+                            
+                            _prompt_in_pixel_values.append(_source_pixel_value)
+                            _prompt_in_sizes.append([source_image_width, source_image_height])
+
+                        condition_images.append(_prompt_in_pixel_values)
+                        condition_image_sizes.append(_prompt_in_sizes)
+                        vae_images.append(_prompt_in_pixel_values)
+                        vae_image_sizes.append(_prompt_in_sizes)
+                else:
+                    for source_pixel_value in source_pixel_values:
+                        _condition_images = []
+                        _condition_image_sizes = []
+                        _vae_images = []
+                        _vae_image_sizes = []
+                        for _source_pixel_value in source_pixel_value:
+                            _source_pixel_value = Image.fromarray(np.array(_source_pixel_value, np.uint8))
+
+                            image_width, image_height = _source_pixel_value.size
+                            vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, image_width / image_height)
+                            _vae_image_sizes.append((vae_width, vae_height))
+                            _vae_images.append(_source_pixel_value.resize((vae_width, vae_height), resample=Image.LANCZOS))
+
+                            condition_width, condition_height = calculate_dimensions(CONDITION_IMAGE_SIZE, image_width / image_height)
+                            _condition_image_sizes.append((condition_width, condition_height))
+                            _condition_images.append(_source_pixel_value.resize((condition_width, condition_height), resample=Image.LANCZOS))
+
+                        condition_images.append(_condition_images)
+                        condition_image_sizes.append(_condition_image_sizes)
+                        vae_images.append(_vae_images)
+                        vae_image_sizes.append(_vae_image_sizes)
 
                 if args.low_vram:
                     torch.cuda.empty_cache()
                     vae.to(accelerator.device)
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to("cpu")
-                        text_encoder_2.to("cpu")
 
                 with torch.no_grad():
                     # This way is quicker when batch grows up
                     def _batch_encode_vae(pixel_values):
-                        pixel_values = pixel_values.squeeze(1)
+                        pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
                         bs = args.vae_mini_batch
                         new_pixel_values = []
                         for i in range(0, pixel_values.shape[0], bs):
@@ -1479,7 +1440,32 @@ def main():
                             latents = _batch_encode_vae(pixel_values)
                     else:
                         latents = _batch_encode_vae(pixel_values)
-                    latents = ((latents - vae.config.shift_factor) * vae.config.scaling_factor).to(dtype=weight_dtype)
+                    latents = ((latents - latents_mean) * latents_std).to(dtype=weight_dtype)
+
+                    source_latents = []
+                    source_exist = False
+                    for _vae_images in vae_images:
+                        _source_latents = []
+                        for _vae_image in _vae_images:
+                            _vae_image = torch.from_numpy(np.expand_dims(np.array(_vae_image), 0)).to(dtype=weight_dtype, device=vae.device)
+                            _vae_image = _vae_image.permute(0, 3, 1, 2).contiguous().unsqueeze(0)
+                            _vae_image = _vae_image / 255.
+                            _vae_image = (_vae_image - 0.5) / 0.5
+
+                            _source_latent = _batch_encode_vae(_vae_image)
+                            _source_latent = ((_source_latent - latents_mean) * latents_std).to(dtype=weight_dtype)
+
+                            bsz, source_channel, _, source_latent_height, source_latent_width = _source_latent.size()
+                            _source_latent = _pack_latents(_source_latent, bsz, source_channel, source_latent_height, source_latent_width)
+                            _source_latents.append(_source_latent)
+                        if len(_source_latents) != 0: 
+                            _source_latents = torch.cat(_source_latents, dim = 1)
+                            source_exist = True
+                        source_latents.append(_source_latents)
+                    if source_exist:
+                        source_latents = torch.cat(source_latents, dim = 0)
+                    else:
+                        source_latents = None                        
 
                 # wait for latents = vae.encode(pixel_values) to complete
                 if vae_stream_1 is not None:
@@ -1490,37 +1476,78 @@ def main():
                     torch.cuda.empty_cache()
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to(accelerator.device)
-                        text_encoder_2.to(accelerator.device)
 
                 if args.enable_text_encoder_in_dataloader:
-                    prompt_embeds = batch['prompt_embeds'].to(dtype=latents.dtype, device=accelerator.device)
-                    pooled_prompt_embeds = batch['pooled_prompt_embeds'].to(dtype=latents.dtype, device=accelerator.device)
-                    text_ids = batch['text_ids']
+                    prompt_embeds = batch['encoder_hidden_states'].to(device=latents.device)
+                    encoder_attention_mask = batch['encoder_attention_mask']
                 else:
                     with torch.no_grad():
-                        prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
-                            batch['text'], dtype=latents.dtype, device=accelerator.device,
-                            text_encoder=text_encoder, 
-                            tokenizer=tokenizer,
-                            text_encoder_2=text_encoder_2, 
-                            tokenizer_2=tokenizer_2,
+                        if args.train_mode == "qwen_image_edit":
+                            if source_exist:
+                                prompt_in_pixel_values = condition_images[0][:1]
+                            else:
+                                prompt_in_pixel_values = None
+                            base_img_prompt = ""
+                            txt = [template.format(e) for e in batch['text']]
+                        else:
+                            if source_exist:
+                                prompt_in_pixel_values = condition_images[0]
+                            else:
+                                prompt_in_pixel_values = None
+                            
+                            img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
+                            if isinstance(prompt_in_pixel_values, list):
+                                base_img_prompt = ""
+                                for i, img in enumerate(prompt_in_pixel_values):
+                                    base_img_prompt += img_prompt_template.format(i + 1)
+                            elif prompt_in_pixel_values is not None:
+                                base_img_prompt = img_prompt_template.format(1)
+                            else:
+                                base_img_prompt = ""
+
+                            txt = [template.format(base_img_prompt + e) for e in batch['text']]
+
+                        model_inputs = processor(
+                            text=txt,
+                            images=prompt_in_pixel_values,
+                            padding=True,
+                            return_tensors="pt",
+                        ).to(accelerator.device)
+                        if prompt_in_pixel_values is None:
+                            encoder_hidden_states = text_encoder(
+                                input_ids=model_inputs.input_ids,
+                                attention_mask=model_inputs.attention_mask,
+                                output_hidden_states=True,
+                            )
+                        else:
+                            encoder_hidden_states = text_encoder(
+                                input_ids=model_inputs.input_ids,
+                                attention_mask=model_inputs.attention_mask,
+                                pixel_values=model_inputs.pixel_values,
+                                image_grid_thw=model_inputs.image_grid_thw,
+                                output_hidden_states=True,
+                            )
+                        hidden_states = encoder_hidden_states.hidden_states[-1]
+                        split_hidden_states = _extract_masked_hidden(hidden_states, model_inputs.attention_mask)
+                        split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+                        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+                        max_seq_len = max([e.size(0) for e in split_hidden_states])
+                        prompt_embeds = torch.stack(
+                            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
                         )
+                        encoder_attention_mask = torch.stack(
+                            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
+                        )
+
+                        prompt_embeds = prompt_embeds.to(dtype=latents.dtype, device=accelerator.device)
 
                 if args.low_vram and not args.enable_text_encoder_in_dataloader:
                     text_encoder.to('cpu')
-                    text_encoder_2.to('cpu')
                     torch.cuda.empty_cache()
 
-                bsz, channel, height, width = latents.size()
+                bsz, channel, num_frame, height, width = latents.size()
                 latents = _pack_latents(latents, bsz, channel, height, width)
-                latent_image_ids = _prepare_latent_image_ids(bsz, height // 2, width // 2, latents.device, weight_dtype)
                 noise = torch.randn(latents.size(), device=latents.device, generator=torch_rng, dtype=weight_dtype)
-                # handle guidance
-                if unwrap_model(transformer3d).config.guidance_embeds:
-                    guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
-                    guidance = guidance.expand(latents.shape[0])
-                else:
-                    guidance = None
 
                 if not args.uniform_sampling:
                     u = compute_density_for_timestep_sampling(
@@ -1569,18 +1596,33 @@ def main():
                 # Add noise
                 target = noise - latents
 
+                img_shapes = [
+                    [
+                        (1, height // 2, width // 2),
+                        *[
+                            (1, vae_height // vae_scale_factor // 2, vae_width // vae_scale_factor // 2)
+                            for vae_width, vae_height in vae_image_sizes[0]
+                        ],
+                    ]
+                ] * latents.size(0)
+                txt_seq_lens = encoder_attention_mask.sum(dim=1).tolist() if encoder_attention_mask is not None else None
+
+                if source_latents is not None:
+                    noisy_latents_and_image_latents = torch.cat([noisy_latents, source_latents], dim=1)
+                else:
+                    noisy_latents_and_image_latents = noisy_latents
                 # Predict the noise residual
                 with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
                     noise_pred = transformer3d(
-                        hidden_states=noisy_latents,
+                        hidden_states=noisy_latents_and_image_latents,
                         timestep=timesteps / 1000,
-                        guidance=guidance,
+                        encoder_hidden_states_mask=encoder_attention_mask,
                         encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled_prompt_embeds,
-                        txt_ids=text_ids,
-                        img_ids=latent_image_ids,
+                        img_shapes=img_shapes,
+                        txt_seq_lens=txt_seq_lens,
                         return_dict=False,
-                    )[0]
+                    )
+                    noise_pred = noise_pred[:, : noisy_latents.size(1)]
                 
                 def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
                     noise_pred = noise_pred.float()
@@ -1655,9 +1697,7 @@ def main():
                         log_validation(
                             vae,
                             text_encoder,
-                            text_encoder_2,
                             tokenizer,
-                            tokenizer_2,
                             transformer3d,
                             network,
                             args,
@@ -1677,9 +1717,7 @@ def main():
                 log_validation(
                     vae,
                     text_encoder,
-                    text_encoder_2,
                     tokenizer,
-                    tokenizer_2,
                     transformer3d,
                     network,
                     args,

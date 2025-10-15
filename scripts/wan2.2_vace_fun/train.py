@@ -1935,7 +1935,7 @@ def main():
                 loss = custom_mse_loss(noise_pred.float(), target.float(), weighting.float())
                 loss = loss.mean()
 
-                if args.motion_sub_loss and noise_pred.size()[1] > 2:
+                if args.motion_sub_loss and noise_pred.size()[2] > 2:
                     gt_sub_noise = noise_pred[:, :, 1:].float() - noise_pred[:, :, :-1].float()
                     pre_sub_noise = target[:, :, 1:].float() - target[:, :, :-1].float()
                     sub_loss = F.mse_loss(gt_sub_noise, pre_sub_noise, reduction="mean")
@@ -2005,6 +2005,9 @@ def main():
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
@@ -2067,6 +2070,9 @@ def main():
             ema_transformer3d.copy_to(transformer3d.parameters())
 
     if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
         accelerator.save_state(save_path)
         logger.info(f"Saved state to {save_path}")
