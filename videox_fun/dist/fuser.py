@@ -1,4 +1,5 @@
 import importlib.util
+import traceback
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,8 @@ try:
         from xfuser.core.long_ctx_attention import xFuserLongContextAttention
         print("Xfuser import sucessful")
 except Exception as ex:
+    traceback.print_exc()
+    print("Warning: xfuser is not installed.")
     get_sequence_parallel_world_size = None
     get_sequence_parallel_rank = None
     xFuserLongContextAttention = None

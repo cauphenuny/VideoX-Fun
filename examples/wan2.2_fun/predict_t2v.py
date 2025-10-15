@@ -3,6 +3,11 @@ import sys
 
 import numpy as np
 import torch
+import decord
+try:
+    from torch_npu.contrib import transfer_to_npu
+except ImportError:
+    pass
 from diffusers import FlowMatchEulerDiscreteScheduler
 from omegaconf import OmegaConf
 from PIL import Image

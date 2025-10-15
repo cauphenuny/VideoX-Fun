@@ -1,7 +1,14 @@
 import os
+import math
+try:
+    import torch_npu
+    NPU_AVAILABLE = True
+except ImportError:
+    NPU_AVAILABLE = False
 
 import torch
 import warnings
+from loguru import logger
 
 try:
     import flash_attn_interface
@@ -204,8 +211,21 @@ def attention(
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+        if NPU_AVAILABLE:
+            # logger.info(f"{q.dtype=}, {k.dtype=}, {v.dtype=}, {q.shape=}, {k.shape=}, {v.shape=}")
+            def apply_fa(query, key, value, dropout_p):
+                n_head = query.shape[1]
+                head_dim = query.shape[-1]
+                scale = 1.0 / math.sqrt(head_dim)
+                output = torch_npu.npu_fusion_attention(
+                    query, key, value, n_head, "BNSD",
+                    scale=scale, keep_prob = 1-dropout_p,
+                )[0]
+                return output
+            out = apply_fa(q, k, v, dropout_p)
+        else:
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
         out = out.transpose(1, 2).contiguous()
     return out

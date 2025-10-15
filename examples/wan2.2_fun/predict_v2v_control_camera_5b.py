@@ -3,10 +3,17 @@ import sys
 
 import numpy as np
 import torch
+import decord # import decord first to avoid error about libavutils.so
+try:
+    from torch_npu.contrib import transfer_to_npu
+    NPU_AVAILABLE = True
+except:
+    NPU_AVAILABLE = False
 from diffusers import FlowMatchEulerDiscreteScheduler
 from omegaconf import OmegaConf
 from PIL import Image
 from transformers import AutoTokenizer
+import argparse
 
 current_file_path = os.path.abspath(__file__)
 project_roots = [os.path.dirname(current_file_path), os.path.dirname(os.path.dirname(current_file_path)), os.path.dirname(os.path.dirname(os.path.dirname(current_file_path)))]
@@ -28,6 +35,13 @@ from videox_fun.utils.utils import (filter_kwargs, get_image_latent, get_image_t
                                     save_videos_grid)
 from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
 from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+parser = argparse.ArgumentParser(description="Process some images.")
+parser.add_argument("--cam", type=str, default="Zoom_In", help="Camera movement type, e.g., Pan_Down, Pan_Up, Zoom_In, Zoom_Out")
+parser.add_argument("--path_suffix", type=str, default="default", help="Suffix for the save path")
+parser.add_argument("--image", type=str, default=None, help="ref image path")
+parser.add_argument("--text", type=str, default=None, help="text prompt")
+args = parser.parse_args()
 
 # GPU memory mode, which can be chosen in [model_full_load, model_cpu_offload_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
 # model_full_load means that the entire model will be moved to the GPU.
@@ -105,7 +119,8 @@ lora_path               = None
 lora_high_path          = None
 
 # Other params
-sample_size         = [704, 1280]
+# sample_size         = [704, 1280]
+sample_size         = [480, 832]
 video_length        = 81
 fps                 = 24
 
@@ -113,14 +128,19 @@ fps                 = 24
 # ome graphics cards, such as v100, 2080ti, do not support torch.bfloat16
 weight_dtype            = torch.bfloat16
 control_video           = None
-control_camera_txt      = "asset/Zoom_In.txt"
-start_image             = "asset/7.png"
+control_camera_txt      = f"asset/{args.cam}.txt"
+start_image             = "asset/temple.png"
+if args.image is not None:
+    start_image         = args.image
 end_image               = None
 ref_image               = None
 
 # 使用更长的neg prompt如"模糊，突变，变形，失真，画面暗，文本字幕，画面固定，连环画，漫画，线稿，没有主体。"，可以增加稳定性
 # 在neg prompt中添加"安静，固定"等词语可以增加动态性。
-prompt                  = "一个小女孩正在户外玩耍。她穿着一件蓝色的短袖上衣和粉色的短裤，头发扎成一个可爱的辫子。她的脚上没有穿鞋，显得非常自然和随意。她正用一把红色的小铲子在泥土里挖土，似乎在进行某种有趣的活动，可能是种花或是挖掘宝藏。地上有一根长长的水管，可能是用来浇水的。背景是一片草地和一些绿色植物，阳光明媚，整个场景充满了童趣和生机。小女孩专注的表情和认真的动作让人感受到她的快乐和好奇心。"
+# prompt                  = "一个小女孩正在户外玩耍。她穿着一件蓝色的短袖上衣和粉色的短裤，头发扎成一个可爱的辫子。她的脚上没有穿鞋，显得非常自然和随意。她正用一把红色的小铲子在泥土里挖土，似乎在进行某种有趣的活动，可能是种花或是挖掘宝藏。地上有一根长长的水管，可能是用来浇水的。背景是一片草地和一些绿色植物，阳光明媚，整个场景充满了童趣和生机。小女孩专注的表情和认真的动作让人感受到她的快乐和好奇心。"
+prompt                  = "An ancient Greek temple in the Doric style stands on a raised platform, with tall stone columns supporting a triangular pediment. The frieze above the columns contains carved reliefs. Stone steps lead up to the entrance, which is aligned with a paved pathway of rectangular slabs. The foreground includes an open courtyard with scattered stone bases and a large vessel-shaped structure. The surrounding area is open, with distant hills and a clear blue sky in the background."
+if args.text is not None:
+    prompt = args.text
 negative_prompt         = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
 # Using longer neg prompt such as "Blurring, mutation, deformation, distortion, dark and solid, comics, text subtitles, line art." can increase stability
@@ -133,7 +153,7 @@ num_inference_steps     = 50
 # The lora_weight is used for low noise model, the lora_high_weight is used for high noise model.
 lora_weight             = 0.55
 lora_high_weight        = 0.55
-save_path               = "samples/wan-videos-fun-control"
+save_path               = "samples/wan-videos-fun-control_5b/" + args.path_suffix + "/"
 
 device = set_multi_gpus_devices(ulysses_degree, ring_degree)
 config = OmegaConf.load(config_path)
@@ -360,7 +380,7 @@ def save_results():
         os.makedirs(save_path, exist_ok=True)
 
     index = len([path for path in os.listdir(save_path)]) + 1
-    prefix = str(index).zfill(8)
+    prefix = str(index).zfill(8) + "_" + args.cam
     if video_length == 1:
         video_path = os.path.join(save_path, prefix + ".png")
 

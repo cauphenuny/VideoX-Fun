@@ -18,6 +18,11 @@ from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import is_torch_version, logging
 from torch import nn
+try:
+    import torch_npu
+    NPU_AVAILABLE = True
+except Exception:
+    NPU_AVAILABLE = False
 
 from ..dist import (get_sequence_parallel_rank,
                     get_sequence_parallel_world_size, get_sp_group,
