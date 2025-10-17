@@ -41,6 +41,8 @@ parser.add_argument("--cam", type=str, default="Zoom_In", help="Camera movement 
 parser.add_argument("--path_suffix", type=str, default="default", help="Suffix for the save path")
 parser.add_argument("--image", type=str, default=None, help="ref image path")
 parser.add_argument("--text", type=str, default=None, help="text prompt")
+parser.add_argument("--width", type=int, default=None, help="Width of the output video")
+parser.add_argument("--height", type=int, default=None, help="Height of the output video")
 args = parser.parse_args()
 
 # GPU memory mode, which can be chosen in [model_full_load, model_cpu_offload_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
@@ -121,6 +123,10 @@ lora_high_path          = None
 # Other params
 # sample_size         = [704, 1280]
 sample_size         = [480, 832]
+if args.width:
+    sample_size[1] = args.width
+if args.height:
+    sample_size[0] = args.height
 video_length        = 81
 fps                 = 24
 

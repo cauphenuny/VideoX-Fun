@@ -119,7 +119,7 @@ def _iter_mp4_files(root: Path) -> Iterable[Path]:
                 yield Path(dirpath) / name
 
 
-def _read_first_frame_pil(video_path: Path) -> Image.Image:
+def _read_first_frame_pil(video_path: Path, width, height) -> Image.Image:
     """读取视频第一帧并返回为 PIL.Image.Image。
 
     优先使用 imageio（RGB），失败则回退到 OpenCV（BGR->RGB）。
@@ -132,7 +132,7 @@ def _read_first_frame_pil(video_path: Path) -> Image.Image:
             frame = reader.get_data(0)  # RGB ndarray
         finally:
             reader.close()
-        return center_crop_resize(Image.fromarray(frame))
+        return center_crop_resize(Image.fromarray(frame), target_w=width, target_h=height)
     except Exception:
         pass
 
@@ -148,7 +148,7 @@ def _read_first_frame_pil(video_path: Path) -> Image.Image:
             raise RuntimeError("无法读取第一帧")
         # BGR -> RGB
         frame = frame[:, :, ::-1]
-        return center_crop_resize(Image.fromarray(frame))
+        return center_crop_resize(Image.fromarray(frame), target_w=width, target_h=height)
     except Exception as e:
         raise RuntimeError(f"读取第一帧失败: {video_path} | {e}")
 
@@ -180,7 +180,7 @@ def sample_mp4_first_frames(
     results: List[Tuple[str, Image.Image]] = []
     for p in sampled:
         try:
-            img = _read_first_frame_pil(p)
+            img = _read_first_frame_pil(p, width=args.width, height=args.height)
             path = str(p)
             title = re.search(title_pattern, path).group(1) if re.search(title_pattern, path) else p.stem
             results.append((path, title, img))
@@ -258,7 +258,7 @@ def main(args):
                         "bash",
                         f"cam_ctrl{suffix}.sh", 
                         "--cam", cam, 
-                        "--path_suffix", f"recam/{sample[1]}", 
+                        "--path_suffix", f"{args.name}/{sample[1]}", 
                         "--image", f.name, 
                         "--text",
                         caption,
@@ -280,9 +280,12 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser()
         parser.add_argument('-k', type=int, default=2, help='Number of mp4 files to sample')
         parser.add_argument('-d', '--dir', type=str, default='asset', help='Directory to search for mp4 files')
+        parser.add_argument('-n', '--name', type=str, default='demo', help='Name of the output directory')
         parser.add_argument('-p', '--pattern', type=str, default=r'([^/\\]+)\.mp4$', help='Regex pattern to extract title from file path')
         parser.add_argument('-t', '--num_threads', type=int, default=3, help='Number of threads to run in parallel for each video')
         parser.add_argument('-m', '--model', type=str, default='14b', help='Model to use')
+        parser.add_argument('--width', type=int, default=832, help='Width of the output video')
+        parser.add_argument('--height', type=int, default=480, help='Height of the output video')
         parser.add_argument('--offset', type=int, default=0, help='Offset for visible env variable')
         args = parser.parse_args()
         main(args)

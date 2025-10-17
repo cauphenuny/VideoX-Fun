@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser(description="Process some images.")
 parser.add_argument("--cam", type=str, default="Zoom_In", help="Camera movement type, e.g., Pan_Down, Pan_Up, Zoom_In, Zoom_Out")
 parser.add_argument("--path_suffix", type=str, default="default", help="Suffix for the save path")
 parser.add_argument("--image", type=str, default=None, help="ref image path")
+parser.add_argument("--video", type=str, default=None, help="ref video path")
 parser.add_argument("--text", type=str, default=None, help="text prompt")
 args = parser.parse_args()
 
@@ -126,7 +127,31 @@ control_video           = None
 control_camera_txt      = f"asset/{args.cam}.txt"
 start_image             = "asset/temple.png"
 if args.image is not None:
+    assert args.video is None, "Please provide either an image or a video, not both."
     start_image         = args.image
+
+if args.video is not None:
+    import cv2
+    import tempfile
+    from pathlib import Path
+
+    def export_first_frame_to_tmp(video_path: str) -> str:
+        """提取视频第一帧，保存到 /tmp 下的临时 PNG 文件，返回图片路径"""
+        cap = cv2.VideoCapture(video_path)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            raise RuntimeError(f"无法读取视频第一帧: {video_path}")
+        # BGR -> RGB
+        frame = frame[:, :, ::-1]
+        with tempfile.NamedTemporaryFile(suffix=".png", dir="/tmp", delete=False) as tmpfile:
+            img_path = tmpfile.name
+            cv2.imwrite(img_path, frame[:, :, ::-1])  # OpenCV写入需要BGR
+        return img_path
+    assert args.image is None, "Please provide either an image or a video, not both."
+
+    start_image = export_first_frame_to_tmp(args.video)
+    
 end_image               = None
 ref_image               = None
 
@@ -142,6 +167,9 @@ if args.text is not None:
 # prompt = "A small brown cartoon mouse is leaning back on the ground, gripping a giant empty martini glass with both hands. The mouse’s expression looks tired, frustrated, or possibly drunk, with drooping eyelids and a slight frown. The setting is indoors with a plain wall and a brown floor, giving focus to the oversized glass and the mouse’s struggle to hold it. The scene has a vintage animation style, typical of mid-20th-century cartoons."
 
 negative_prompt         = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+print(f"Prompt: {prompt}")
+print(f"Cam: {control_camera_txt}")
 
 # Using longer neg prompt such as "Blurring, mutation, deformation, distortion, dark and solid, comics, text subtitles, line art." can increase stability
 # Adding words such as "quiet, solid" to the neg prompt can increase dynamism.
