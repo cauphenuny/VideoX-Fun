@@ -5,7 +5,7 @@ timm
 tomesd
 # torch>=2.1.2
 torch==2.2.0
-torch_npu==2.2.0
+# torch_npu==2.2.0
 torchdiffeq
 torchsde
 decord
@@ -28,3 +28,5 @@ gradio>=3.41.2
 diffusers>=0.30.1,<0.35.0
 transformers>=4.46.2
 librosa
+
+loguru

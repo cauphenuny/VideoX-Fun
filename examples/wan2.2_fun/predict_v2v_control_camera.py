@@ -4,7 +4,11 @@ import sys
 import numpy as np
 import torch
 import decord # import decord first to avoid error about libavutils.so
-from torch_npu.contrib import transfer_to_npu
+from loguru import logger
+try:
+    from torch_npu.contrib import transfer_to_npu
+except Exception:
+    logger.warning("torch_npu.contrib.transfer_to_npu import failed")
 from diffusers import FlowMatchEulerDiscreteScheduler
 from omegaconf import OmegaConf
 from PIL import Image
@@ -124,7 +128,7 @@ fps                 = 16
 weight_dtype            = torch.bfloat16
 control_video           = None
 control_camera_txt      = f"asset/{args.cam}.txt"
-start_image             = "asset/temple.png"
+start_image             = "asset/7.png"
 if args.image is not None:
     start_image         = args.image
 end_image               = None
@@ -133,10 +137,10 @@ ref_image               = None
 # 使用更长的neg prompt如"模糊，突变，变形，失真，画面暗，文本字幕，画面固定，连环画，漫画，线稿，没有主体。"，可以增加稳定性
 # 在neg prompt中添加"安静，固定"等词语可以增加动态性。
 
-# prompt                  = "一个小女孩正在户外玩耍。她穿着一件蓝色的短袖上衣和粉色的短裤，头发扎成一个可爱的辫子。她的脚上没有穿鞋，显得非常自然和随意。她正用一把红色的小铲子在泥土里挖土，似乎在进行某种有趣的活动，可能是种花或是挖掘宝藏。地上有一根长长的水管，可能是用来浇水的。背景是一片草地和一些绿色植物，阳光明媚，整个场景充满了童趣和生机。小女孩专注的表情和认真的动作让人感受到她的快乐和好奇心。"
+prompt                  = "一个小女孩正在户外玩耍。她穿着一件蓝色的短袖上衣和粉色的短裤，头发扎成一个可爱的辫子。她的脚上没有穿鞋，显得非常自然和随意。她正用一把红色的小铲子在泥土里挖土，似乎在进行某种有趣的活动，可能是种花或是挖掘宝藏。地上有一根长长的水管，可能是用来浇水的。背景是一片草地和一些绿色植物，阳光明媚，整个场景充满了童趣和生机。小女孩专注的表情和认真的动作让人感受到她的快乐和好奇心。"
 # prompt                  = "一个小女孩正在户外玩耍。她穿着一件蓝色的短袖上衣和粉色的短裤，头发扎成一个可爱的辫子。她的脚上没有穿鞋，显得非常自然和随意。她正用一把红色的小铲子在泥土里挖土，似乎在进行某种有趣的活动，可能是种花。地上有一根长长的水管，可能是用来浇水的。背景是一片草地和一些绿色植物，阳光明媚，整个场景充满了童趣和生机。小女孩专注的表情和认真的动作让人感受到她的快乐和好奇心。"
 # prompt                  = "A fantasy adventurer with silver hair and a massive, ornate sword on their back walks through a lush, vibrant jungle. Sunlight filters through the tall trees, illuminating vines, roots, and dense green foliage. The atmosphere is mystical and immersive, with glowing fireflies and soft mist drifting through the air. The lone adventurer with silver hair, carrying a massive ornate sword on their back, slowly walks forward through a dense, mystical jungle. They carefully step over roots and push aside hanging vines, their movements deliberate and cautious. The adventurer pauses briefly to observe glowing fireflies around them, then continues deeper into the forest, their hand brushing against nearby plants as they move with steady determination."
-prompt                  = "An ancient Greek temple in the Doric style stands on a raised platform, with tall stone columns supporting a triangular pediment. The frieze above the columns contains carved reliefs. Stone steps lead up to the entrance, which is aligned with a paved pathway of rectangular slabs. The foreground includes an open courtyard with scattered stone bases and a large vessel-shaped structure. The surrounding area is open, with distant hills and a clear blue sky in the background."
+# prompt                  = "An ancient Greek temple in the Doric style stands on a raised platform, with tall stone columns supporting a triangular pediment. The frieze above the columns contains carved reliefs. Stone steps lead up to the entrance, which is aligned with a paved pathway of rectangular slabs. The foreground includes an open courtyard with scattered stone bases and a large vessel-shaped structure. The surrounding area is open, with distant hills and a clear blue sky in the background."
 if args.text is not None:
     prompt = args.text
 # prompt = "A small brown cartoon mouse is leaning back on the ground, gripping a giant empty martini glass with both hands. The mouse’s expression looks tired, frustrated, or possibly drunk, with drooping eyelids and a slight frown. The setting is indoors with a plain wall and a brown floor, giving focus to the oversized glass and the mouse’s struggle to hold it. The scene has a vintage animation style, typical of mid-20th-century cartoons."
